@@ -261,18 +261,36 @@ assign port_tran_sck_dir = 1'b0;    // clock direction can change
 assign port_tran_sd = 1'bz;
 assign port_tran_sd_dir = 1'b0;     // SD is input and not used
 
-// Tie off CRAM0 (not used)
-assign cram0_a = 'h0;
-assign cram0_dq = {16{1'bZ}};
-assign cram0_clk = 0;
-assign cram0_adv_n = 1;
-assign cram0_cre = 0;
-assign cram0_ce0_n = 1;
-assign cram0_ce1_n = 1;
-assign cram0_oe_n = 1;
-assign cram0_we_n = 1;
-assign cram0_ub_n = 1;
-assign cram0_lb_n = 1;
+// PSRAM Controller for CRAM0 (16MB)
+psram_controller #(
+    .CLOCK_SPEED(133.12)
+) psram0 (
+    .clk(clk_ram_controller),
+    .reset_n(reset_n),
+
+    // CPU word interface
+    .word_rd(cpu_psram_rd),
+    .word_wr(cpu_psram_wr),
+    .word_addr(cpu_psram_addr),
+    .word_data(cpu_psram_wdata),
+    .word_q(cpu_psram_rdata),
+    .word_busy(cpu_psram_busy),
+    .word_q_valid(cpu_psram_rdata_valid),
+
+    // Physical PSRAM signals
+    .cram_a(cram0_a),
+    .cram_dq(cram0_dq),
+    .cram_wait(cram0_wait),
+    .cram_clk(cram0_clk),
+    .cram_adv_n(cram0_adv_n),
+    .cram_cre(cram0_cre),
+    .cram_ce0_n(cram0_ce0_n),
+    .cram_ce1_n(cram0_ce1_n),
+    .cram_oe_n(cram0_oe_n),
+    .cram_we_n(cram0_we_n),
+    .cram_ub_n(cram0_ub_n),
+    .cram_lb_n(cram0_lb_n)
+);
 
 // Tie off CRAM1 (not used)
 assign cram1_a = 'h0;
@@ -303,6 +321,15 @@ wire [23:0] cpu_sdram_addr;
 wire [31:0] cpu_sdram_wdata;
 wire [31:0] cpu_sdram_rdata;
 wire        cpu_sdram_busy;
+
+// CPU to PSRAM interface
+wire        cpu_psram_rd;
+wire        cpu_psram_wr;
+wire [21:0] cpu_psram_addr;
+wire [31:0] cpu_psram_wdata;
+wire [31:0] cpu_psram_rdata;
+wire        cpu_psram_busy;
+wire        cpu_psram_rdata_valid;
 
 assign sram_a = 'h0;
 assign sram_dq = {16{1'bZ}};
@@ -730,6 +757,14 @@ assign video_hs = vidout_hs;
         .sdram_rdata(cpu_sdram_rdata),
         .sdram_busy(cpu_sdram_busy),
         .sdram_rdata_valid(ram1_word_q_valid),
+        // PSRAM interface (to psram_controller)
+        .psram_rd(cpu_psram_rd),
+        .psram_wr(cpu_psram_wr),
+        .psram_addr(cpu_psram_addr),
+        .psram_wdata(cpu_psram_wdata),
+        .psram_rdata(cpu_psram_rdata),
+        .psram_busy(cpu_psram_busy),
+        .psram_rdata_valid(cpu_psram_rdata_valid),
         // Display control
         .display_mode(display_mode),
         .fb_display_addr(fb_display_addr)

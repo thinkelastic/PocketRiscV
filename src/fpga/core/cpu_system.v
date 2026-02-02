@@ -4,6 +4,7 @@
 // - 64KB RAM for program/data (using block RAM)
 // - Memory-mapped terminal at 0x20000000
 // - SDRAM access at 0x10000000 (64MB) - includes framebuffer
+// - PSRAM access at 0x30000000 (16MB) - cram0 chip
 // - System registers at 0x40000000
 //
 
@@ -33,6 +34,15 @@ module cpu_system (
     input wire  [31:0] sdram_rdata,
     input wire         sdram_busy,
     input wire         sdram_rdata_valid,  // Pulses when read data is valid
+
+    // PSRAM word interface (to psram_controller via core_top)
+    output reg         psram_rd,
+    output reg         psram_wr,
+    output reg  [21:0] psram_addr,         // 22-bit word address (16MB addressable)
+    output reg  [31:0] psram_wdata,
+    input wire  [31:0] psram_rdata,
+    input wire         psram_busy,
+    input wire         psram_rdata_valid,  // Pulses when read data is valid
 
     // Display control outputs
     output wire        display_mode,       // 0=terminal overlay, 1=framebuffer only
@@ -136,12 +146,14 @@ wire        mem_write = dbus_grant & dbus_we;
 //   Framebuffer 0: 0x10000000 - 0x10025800 (153,600 bytes)
 //   Framebuffer 1: 0x10100000 - 0x10125800 (153,600 bytes)
 // 0x20000000 - 0x20001FFF : Terminal VRAM
+// 0x30000000 - 0x30FFFFFF : PSRAM (16MB) - cram0 chip
 // 0x40000000 - 0x400000FF : System registers
 
 // Decode memory regions
 wire ram_select    = (mem_addr[31:16] == 16'b0);                    // 0x00000000-0x0000FFFF (64KB)
 wire sdram_select  = (mem_addr[31:26] == 6'b000100);                // 0x10000000-0x13FFFFFF (64MB)
 wire term_select   = (mem_addr[31:13] == 19'h10000);                // 0x20000000-0x20001FFF
+wire psram_select  = (mem_addr[31:24] == 8'h30);                    // 0x30000000-0x30FFFFFF (16MB)
 wire sysreg_select = (mem_addr[31:8] == 24'h400000);                // 0x40000000-0x400000FF
 
 // ============================================
@@ -294,6 +306,9 @@ reg term_pending;
 reg sdram_read_pending;
 reg sdram_write_pending;
 reg sdram_write_started;
+reg psram_read_pending;
+reg psram_write_pending;
+reg psram_write_started;
 reg sysreg_pending;
 reg [31:0] pending_rdata;
 
@@ -314,11 +329,18 @@ always @(posedge clk or posedge reset) begin
         sdram_read_pending <= 0;
         sdram_write_pending <= 0;
         sdram_write_started <= 0;
+        psram_read_pending <= 0;
+        psram_write_pending <= 0;
+        psram_write_started <= 0;
         sysreg_pending <= 0;
         sdram_rd <= 0;
         sdram_wr <= 0;
         sdram_addr <= 0;
         sdram_wdata <= 0;
+        psram_rd <= 0;
+        psram_wr <= 0;
+        psram_addr <= 0;
+        psram_wdata <= 0;
         pending_rdata <= 0;
     end else begin
         // Default: deassert ACKs and single-cycle signals
@@ -326,6 +348,8 @@ always @(posedge clk or posedge reset) begin
         dbus_ack <= 0;
         sdram_rd <= 0;
         sdram_wr <= 0;
+        psram_rd <= 0;
+        psram_wr <= 0;
 
         if (!mem_pending && mem_valid) begin
             // Start new memory access
@@ -346,6 +370,19 @@ always @(posedge clk or posedge reset) begin
                     sdram_rd <= 1;
                     mem_pending <= 1;
                     sdram_read_pending <= 1;
+                end
+            end else if (psram_select) begin
+                psram_addr <= mem_addr[23:2];  // 22-bit word address for 16MB
+                if (mem_write) begin
+                    psram_wr <= 1;
+                    psram_wdata <= mem_wdata;
+                    mem_pending <= 1;
+                    psram_write_pending <= 1;
+                    psram_write_started <= 0;
+                end else begin
+                    psram_rd <= 1;
+                    mem_pending <= 1;
+                    psram_read_pending <= 1;
                 end
             end else if (term_select) begin
                 mem_pending <= 1;
@@ -404,6 +441,35 @@ always @(posedge clk or posedge reset) begin
                     mem_pending <= 0;
                     sdram_write_pending <= 0;
                     sdram_write_started <= 0;
+                    pending_bus <= BUS_NONE;
+                end
+            end else if (psram_read_pending && psram_rdata_valid) begin
+                pending_rdata <= psram_rdata;
+                if (pending_bus == BUS_DBUS) begin
+                    dbus_ack <= 1;
+                    dbus_dat_miso <= psram_rdata;
+                end else begin
+                    ibus_ack <= 1;
+                    ibus_dat_miso <= psram_rdata;
+                end
+                mem_pending <= 0;
+                psram_read_pending <= 0;
+                pending_bus <= BUS_NONE;
+            end else if (psram_write_pending) begin
+                // Write: wait for busy HIGH then LOW
+                if (!psram_write_started && psram_busy) begin
+                    psram_write_started <= 1;
+                end else if (psram_write_started && !psram_busy) begin
+                    if (pending_bus == BUS_DBUS) begin
+                        dbus_ack <= 1;
+                        dbus_dat_miso <= 32'h0;
+                    end else begin
+                        ibus_ack <= 1;
+                        ibus_dat_miso <= 32'h0;
+                    end
+                    mem_pending <= 0;
+                    psram_write_pending <= 0;
+                    psram_write_started <= 0;
                     pending_bus <= BUS_NONE;
                 end
             end else if (term_pending && term_mem_ready) begin

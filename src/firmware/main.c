@@ -21,6 +21,10 @@
 #define SDRAM_TEST_BASE   ((volatile uint32_t*)0x10200000)
 #define SDRAM_TEST_SIZE   (1024 * 1024)  /* 1MB test region */
 
+/* PSRAM test region */
+#define PSRAM_TEST_BASE   ((volatile uint32_t*)0x30000000)
+#define PSRAM_TEST_SIZE   (1024 * 1024)  /* 1MB test region (of 16MB available) */
+
 /* Display constants */
 #define FB_WIDTH   320
 #define FB_HEIGHT  240
@@ -45,6 +49,8 @@ static volatile uint16_t* draw_buffer = FRAMEBUFFER_1;
 /* Test results */
 static int sdram_errors = 0;
 static int sdram_mb_tested = 0;
+static int psram_errors = 0;
+static int psram_mb_tested = 0;
 static int cpu_tests_passed = 0;
 static int cpu_tests_total = 0;
 
@@ -228,6 +234,75 @@ static int test_sdram_address(int offset, int count) {
 }
 
 /* ============================================ */
+/* PSRAM Stress Test                            */
+/* ============================================ */
+
+static int test_psram_pattern(uint32_t pattern, int offset, int count) {
+    volatile uint32_t* base = PSRAM_TEST_BASE + offset;
+    int errors = 0;
+
+    /* Write pattern */
+    for (int i = 0; i < count; i++) {
+        base[i] = pattern;
+    }
+
+    /* Read and verify */
+    for (int i = 0; i < count; i++) {
+        uint32_t val = base[i];
+        if (val != pattern) {
+            errors++;
+        }
+    }
+
+    return errors;
+}
+
+static int test_psram_walking(int offset, int count) {
+    volatile uint32_t* base = PSRAM_TEST_BASE + offset;
+    int errors = 0;
+
+    /* Walking ones */
+    for (int i = 0; i < count && i < 32; i++) {
+        uint32_t pattern = 1 << i;
+        base[i] = pattern;
+    }
+    for (int i = 0; i < count && i < 32; i++) {
+        uint32_t expected = 1 << i;
+        if (base[i] != expected) errors++;
+    }
+
+    /* Walking zeros */
+    for (int i = 0; i < count && i < 32; i++) {
+        uint32_t pattern = ~(1 << i);
+        base[i] = pattern;
+    }
+    for (int i = 0; i < count && i < 32; i++) {
+        uint32_t expected = ~(1 << i);
+        if (base[i] != expected) errors++;
+    }
+
+    return errors;
+}
+
+static int test_psram_address(int offset, int count) {
+    volatile uint32_t* base = PSRAM_TEST_BASE + offset;
+    int errors = 0;
+
+    /* Write address as data */
+    for (int i = 0; i < count; i++) {
+        base[i] = (uint32_t)(uintptr_t)&base[i];
+    }
+
+    /* Verify */
+    for (int i = 0; i < count; i++) {
+        uint32_t expected = (uint32_t)(uintptr_t)&base[i];
+        if (base[i] != expected) errors++;
+    }
+
+    return errors;
+}
+
+/* ============================================ */
 /* CPU Instruction Tests                        */
 /* ============================================ */
 
@@ -322,80 +397,110 @@ static void swap_buffers(void) {
 /* Main dashboard                               */
 /* ============================================ */
 
-static void draw_dashboard(int sdram_progress, uint32_t cycles) {
+static void draw_dashboard(int sdram_progress, int psram_progress, uint32_t cycles) {
     /* Clear screen */
     fill_rect(0, 0, FB_WIDTH, FB_HEIGHT, COL_BG);
 
     /* Title */
-    fill_rect(0, 0, FB_WIDTH, 16, COL_TITLE_BG);
-    draw_string_center(4, "PocketRiscV System Dashboard", COL_HIGHLIGHT);
+    fill_rect(0, 0, FB_WIDTH, 14, COL_TITLE_BG);
+    draw_string_center(3, "PocketRiscV System Dashboard", COL_HIGHLIGHT);
 
     /* System info panel */
-    draw_panel(5, 22, 150, 50, "System Info");
-    draw_string(10, 36, "CPU:", COL_TEXT_DIM);
-    draw_string(50, 36, "VexRiscv 133MHz", COL_TEXT);
-    draw_string(10, 46, "RAM:", COL_TEXT_DIM);
-    draw_string(50, 46, "64KB BRAM", COL_TEXT);
-    draw_string(10, 56, "SDRAM:", COL_TEXT_DIM);
-    draw_string(58, 56, "64MB", COL_TEXT);
+    draw_panel(5, 18, 150, 38, "System Info");
+    draw_string(10, 32, "CPU:", COL_TEXT_DIM);
+    draw_string(42, 32, "VexRiscv 133MHz", COL_TEXT);
+    draw_string(10, 42, "SDRAM:", COL_TEXT_DIM);
+    draw_string(58, 42, "64MB", COL_TEXT);
+    draw_string(95, 42, "PSRAM:", COL_TEXT_DIM);
+    draw_string(143, 42, "16MB", COL_TEXT);
 
     /* Cycle counter panel */
-    draw_panel(165, 22, 150, 50, "Cycle Counter");
-    draw_string(170, 40, "Cycles:", COL_TEXT_DIM);
-    draw_hex(230, 40, cycles >> 16, 4, COL_TEXT);
-    draw_hex(262, 40, cycles & 0xFFFF, 4, COL_TEXT);
+    draw_panel(165, 18, 150, 38, "Cycle Counter");
+    draw_string(170, 36, "Cycles:", COL_TEXT_DIM);
+    draw_hex(230, 36, cycles >> 16, 4, COL_TEXT);
+    draw_hex(262, 36, cycles & 0xFFFF, 4, COL_TEXT);
 
     /* SDRAM Test panel */
-    draw_panel(5, 78, 310, 70, "SDRAM Stress Test");
+    draw_panel(5, 60, 155, 58, "SDRAM Test");
 
-    draw_string(10, 94, "Progress:", COL_TEXT_DIM);
-    draw_progress_bar(80, 92, 180, 12, sdram_progress, COL_PROGRESS, COL_PROGRESS_BG);
+    draw_string(10, 74, "Prog:", COL_TEXT_DIM);
+    draw_progress_bar(48, 73, 80, 10, sdram_progress, COL_PROGRESS, COL_PROGRESS_BG);
     char pct[8];
     pct[0] = '0' + (sdram_progress / 100) % 10;
     pct[1] = '0' + (sdram_progress / 10) % 10;
     pct[2] = '0' + sdram_progress % 10;
     pct[3] = '%';
     pct[4] = '\0';
-    draw_string(268, 94, pct, COL_TEXT);
+    draw_string(132, 74, pct, COL_TEXT);
 
-    draw_string(10, 110, "Tested:", COL_TEXT_DIM);
-    draw_number(70, 110, sdram_mb_tested, 4, COL_TEXT);
-    draw_string(110, 110, "KB", COL_TEXT);
+    draw_string(10, 86, "KB:", COL_TEXT_DIM);
+    draw_number(32, 86, sdram_mb_tested, 4, COL_TEXT);
+    draw_string(80, 86, "Err:", COL_TEXT_DIM);
+    draw_number(108, 86, sdram_errors, 4, sdram_errors == 0 ? COL_PASS : COL_FAIL);
 
-    draw_string(150, 110, "Errors:", COL_TEXT_DIM);
-    draw_number(210, 110, sdram_errors, 6, sdram_errors == 0 ? COL_PASS : COL_FAIL);
-
-    draw_string(10, 126, "Status:", COL_TEXT_DIM);
+    draw_string(10, 100, "Status:", COL_TEXT_DIM);
     if (sdram_progress < 100) {
-        draw_string(70, 126, "Testing...", COL_WARN);
+        draw_string(62, 100, "Testing...", COL_WARN);
     } else if (sdram_errors == 0) {
-        draw_string(70, 126, "PASSED", COL_PASS);
+        draw_string(62, 100, "PASSED", COL_PASS);
     } else {
-        draw_string(70, 126, "FAILED", COL_FAIL);
+        draw_string(62, 100, "FAILED", COL_FAIL);
+    }
+
+    /* PSRAM Test panel */
+    draw_panel(165, 60, 150, 58, "PSRAM Test");
+
+    draw_string(170, 74, "Prog:", COL_TEXT_DIM);
+    draw_progress_bar(208, 73, 80, 10, psram_progress, COL_PROGRESS, COL_PROGRESS_BG);
+    char pct2[8];
+    pct2[0] = '0' + (psram_progress / 100) % 10;
+    pct2[1] = '0' + (psram_progress / 10) % 10;
+    pct2[2] = '0' + psram_progress % 10;
+    pct2[3] = '%';
+    pct2[4] = '\0';
+    draw_string(292, 74, pct2, COL_TEXT);
+
+    draw_string(170, 86, "KB:", COL_TEXT_DIM);
+    draw_number(192, 86, psram_mb_tested, 4, COL_TEXT);
+    draw_string(240, 86, "Err:", COL_TEXT_DIM);
+    draw_number(268, 86, psram_errors, 4, psram_errors == 0 ? COL_PASS : COL_FAIL);
+
+    draw_string(170, 100, "Status:", COL_TEXT_DIM);
+    if (psram_progress < 100) {
+        draw_string(222, 100, "Testing...", COL_WARN);
+    } else if (psram_errors == 0) {
+        draw_string(222, 100, "PASSED", COL_PASS);
+    } else {
+        draw_string(222, 100, "FAILED", COL_FAIL);
     }
 
     /* CPU Test panel */
-    draw_panel(5, 154, 310, 80, "CPU Instruction Tests");
+    draw_panel(5, 122, 310, 115, "CPU Instruction Tests");
 
-    draw_string(10, 170, "Arithmetic:", COL_TEXT_DIM);
-    draw_string(10, 182, "Logical:", COL_TEXT_DIM);
-    draw_string(10, 194, "Shifts:", COL_TEXT_DIM);
-    draw_string(10, 206, "Compare:", COL_TEXT_DIM);
-    draw_string(10, 218, "Memory:", COL_TEXT_DIM);
-
-    draw_string(160, 170, "Branch:", COL_TEXT_DIM);
+    draw_string(10, 136, "Arithmetic:", COL_TEXT_DIM);
+    draw_string(96, 136, "ADD SUB MUL DIV REM NEG", COL_TEXT);
+    draw_string(10, 148, "Logical:", COL_TEXT_DIM);
+    draw_string(80, 148, "AND OR XOR NOT", COL_TEXT);
+    draw_string(10, 160, "Shifts:", COL_TEXT_DIM);
+    draw_string(72, 160, "SLL SRL SRA", COL_TEXT);
+    draw_string(10, 172, "Compare:", COL_TEXT_DIM);
+    draw_string(80, 172, "SLT SGE SLTU", COL_TEXT);
+    draw_string(10, 184, "Memory:", COL_TEXT_DIM);
+    draw_string(72, 184, "LW/SW LH/SH LB/SB", COL_TEXT);
+    draw_string(10, 196, "Branch:", COL_TEXT_DIM);
+    draw_string(72, 196, "BEQ BNE BLT BGE", COL_TEXT);
 
     /* Results */
-    draw_string(110, 218, "Total:", COL_TEXT_DIM);
-    draw_number(160, 218, cpu_tests_passed, 2, COL_TEXT);
-    draw_string(180, 218, "/", COL_TEXT);
-    draw_number(190, 218, cpu_tests_total, 2, COL_TEXT);
+    draw_string(10, 218, "Total:", COL_TEXT_DIM);
+    draw_number(60, 218, cpu_tests_passed, 2, COL_TEXT);
+    draw_string(80, 218, "/", COL_TEXT);
+    draw_number(90, 218, cpu_tests_total, 2, COL_TEXT);
 
     if (cpu_tests_total > 0) {
         if (cpu_tests_passed == cpu_tests_total) {
-            draw_string(230, 218, "ALL PASS", COL_PASS);
+            draw_string(130, 218, "ALL PASS", COL_PASS);
         } else {
-            draw_string(230, 218, "FAILED", COL_FAIL);
+            draw_string(130, 218, "FAILED", COL_FAIL);
         }
     }
 }
@@ -412,54 +517,92 @@ int main(void) {
     test_cpu_memory();
     test_cpu_branch();
 
-    /* Main loop - run SDRAM tests */
-    int test_phase = 0;
-    int test_offset = 0;
+    /* Main loop - run SDRAM and PSRAM tests */
+    int sdram_test_phase = 0;
+    int sdram_test_offset = 0;
+    int psram_test_phase = 0;
+    int psram_test_offset = 0;
     int words_per_iter = 1024;  /* Test 4KB per iteration */
-    int total_words = SDRAM_TEST_SIZE / 4;
+    int sdram_total_words = SDRAM_TEST_SIZE / 4;
+    int psram_total_words = PSRAM_TEST_SIZE / 4;
 
     while (1) {
         uint32_t cycles = SYS_CYCLE_LO;
 
         /* Calculate progress */
-        int progress = (test_offset * 100) / total_words;
-        if (progress > 100) progress = 100;
+        int sdram_progress = (sdram_test_offset * 100) / sdram_total_words;
+        if (sdram_progress > 100) sdram_progress = 100;
+        int psram_progress = (psram_test_offset * 100) / psram_total_words;
+        if (psram_progress > 100) psram_progress = 100;
 
         /* Draw dashboard */
-        draw_dashboard(progress, cycles);
+        draw_dashboard(sdram_progress, psram_progress, cycles);
         swap_buffers();
 
         /* Run SDRAM tests if not complete */
-        if (test_offset < total_words) {
+        if (sdram_test_offset < sdram_total_words) {
             int count = words_per_iter;
-            if (test_offset + count > total_words) {
-                count = total_words - test_offset;
+            if (sdram_test_offset + count > sdram_total_words) {
+                count = sdram_total_words - sdram_test_offset;
             }
 
-            switch (test_phase) {
+            switch (sdram_test_phase) {
                 case 0:
-                    sdram_errors += test_sdram_pattern(0xAAAAAAAA, test_offset, count);
+                    sdram_errors += test_sdram_pattern(0xAAAAAAAA, sdram_test_offset, count);
                     break;
                 case 1:
-                    sdram_errors += test_sdram_pattern(0x55555555, test_offset, count);
+                    sdram_errors += test_sdram_pattern(0x55555555, sdram_test_offset, count);
                     break;
                 case 2:
-                    sdram_errors += test_sdram_pattern(0xFFFFFFFF, test_offset, count);
+                    sdram_errors += test_sdram_pattern(0xFFFFFFFF, sdram_test_offset, count);
                     break;
                 case 3:
-                    sdram_errors += test_sdram_pattern(0x00000000, test_offset, count);
+                    sdram_errors += test_sdram_pattern(0x00000000, sdram_test_offset, count);
                     break;
                 case 4:
-                    sdram_errors += test_sdram_walking(test_offset, count);
+                    sdram_errors += test_sdram_walking(sdram_test_offset, count);
                     break;
                 case 5:
-                    sdram_errors += test_sdram_address(test_offset, count);
-                    test_offset += count;
-                    sdram_mb_tested = (test_offset * 4) / 1024;
+                    sdram_errors += test_sdram_address(sdram_test_offset, count);
+                    sdram_test_offset += count;
+                    sdram_mb_tested = (sdram_test_offset * 4) / 1024;
                     break;
             }
 
-            test_phase = (test_phase + 1) % 6;
+            sdram_test_phase = (sdram_test_phase + 1) % 6;
+        }
+
+        /* Run PSRAM tests if not complete */
+        if (psram_test_offset < psram_total_words) {
+            int count = words_per_iter;
+            if (psram_test_offset + count > psram_total_words) {
+                count = psram_total_words - psram_test_offset;
+            }
+
+            switch (psram_test_phase) {
+                case 0:
+                    psram_errors += test_psram_pattern(0xAAAAAAAA, psram_test_offset, count);
+                    break;
+                case 1:
+                    psram_errors += test_psram_pattern(0x55555555, psram_test_offset, count);
+                    break;
+                case 2:
+                    psram_errors += test_psram_pattern(0xFFFFFFFF, psram_test_offset, count);
+                    break;
+                case 3:
+                    psram_errors += test_psram_pattern(0x00000000, psram_test_offset, count);
+                    break;
+                case 4:
+                    psram_errors += test_psram_walking(psram_test_offset, count);
+                    break;
+                case 5:
+                    psram_errors += test_psram_address(psram_test_offset, count);
+                    psram_test_offset += count;
+                    psram_mb_tested = (psram_test_offset * 4) / 1024;
+                    break;
+            }
+
+            psram_test_phase = (psram_test_phase + 1) % 6;
         }
     }
 

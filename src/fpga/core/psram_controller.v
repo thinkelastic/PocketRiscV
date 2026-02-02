@@ -5,7 +5,7 @@
 `default_nettype none
 
 module psram_controller #(
-    parameter CLOCK_SPEED = 57.051425  // MHz (closest PLL achievable to 57.12)
+    parameter CLOCK_SPEED = 133.12  // MHz - same as CPU/SDRAM for simple integration
 ) (
     input wire clk,
     input wire reset_n,
@@ -17,6 +17,7 @@ module psram_controller #(
     input wire  [31:0] word_data,
     output reg  [31:0] word_q,
     output reg         word_busy,
+    output reg         word_q_valid,  // Pulses when read data is valid
 
     // PSRAM physical signals
     output wire [21:16] cram_a,
@@ -107,6 +108,7 @@ always @(posedge clk or negedge reset_n) begin
         state <= ST_IDLE;
         word_busy <= 1'b0;
         word_q <= 32'b0;
+        word_q_valid <= 1'b0;
         is_write <= 1'b0;
         latched_data <= 32'b0;
         latched_addr <= 22'b0;
@@ -120,6 +122,7 @@ always @(posedge clk or negedge reset_n) begin
         // Default: clear single-cycle signals
         psram_write_en <= 1'b0;
         psram_read_en <= 1'b0;
+        word_q_valid <= 1'b0;
 
         case (state)
             ST_IDLE: begin
@@ -199,6 +202,9 @@ always @(posedge clk or negedge reset_n) begin
 
             ST_DONE: begin
                 word_busy <= 1'b0;
+                if (!is_write) begin
+                    word_q_valid <= 1'b1;  // Pulse valid on read completion
+                end
                 state <= ST_IDLE;
             end
 
