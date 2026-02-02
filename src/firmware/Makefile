@@ -1,8 +1,9 @@
-# VexRiscv Minimal Firmware Makefile
-# Assembly-only Hello World
+# VexRiscv Firmware Makefile
+# C program with minimal assembly startup
 
 # Toolchain
 CROSS = riscv64-elf-
+CC = $(CROSS)gcc
 AS = $(CROSS)gcc
 LD = $(CROSS)gcc
 OBJCOPY = $(CROSS)objcopy
@@ -15,19 +16,30 @@ TARGET = firmware
 # Directories
 FPGA_CORE_DIR = ../fpga/core
 
-# Assembly sources
-SRCS_S = start.S
-OBJS = $(SRCS_S:.S=.o)
+# Source files
+SRCS_S = crt0.S
+SRCS_C = main.c
+OBJS = $(SRCS_S:.S=.o) $(SRCS_C:.c=.o)
 
 # Architecture flags for RV32IM
 ARCH = rv32im
 ABI = ilp32
 
+# Common flags
+ARCHFLAGS = -march=$(ARCH) -mabi=$(ABI)
+
+# C compiler flags
+CFLAGS = $(ARCHFLAGS)
+CFLAGS += -O2 -g
+CFLAGS += -ffreestanding -fno-builtin
+CFLAGS += -Wall -Wextra
+CFLAGS += -ffunction-sections -fdata-sections
+
 # Assembler flags
-ASFLAGS = -march=$(ARCH) -mabi=$(ABI)
+ASFLAGS = $(ARCHFLAGS)
 
 # Linker flags
-LDFLAGS = -march=$(ARCH) -mabi=$(ABI)
+LDFLAGS = $(ARCHFLAGS)
 LDFLAGS += -T linker.ld -nostdlib -nostartfiles
 LDFLAGS += -Wl,--gc-sections
 LDFLAGS += -Wl,-Map=$(TARGET).map
@@ -67,6 +79,10 @@ $(TARGET).mif: $(TARGET).bin
 	@echo "END;" >> $@
 	@echo "Generated $@ with $$(hexdump -v -e '1/4 "%08X\n"' $< | wc -l) words of firmware"
 
+# Compile C sources
+%.o: %.c
+	$(CC) $(CFLAGS) -c -o $@ $<
+
 # Assemble assembly sources
 %.o: %.S
 	$(AS) $(ASFLAGS) -c -o $@ $<
@@ -76,6 +92,10 @@ install: $(TARGET).bin $(TARGET).mif
 	cp $(TARGET).mif $(FPGA_CORE_DIR)/firmware.mif
 	@echo "MIF installed to $(FPGA_CORE_DIR)/firmware.mif"
 
+# Disassembly
+disasm: $(TARGET).elf
+	$(OBJDUMP) -d $<
+
 # Clean build artifacts
 clean:
 	rm -f $(OBJS) $(TARGET).elf $(TARGET).bin $(TARGET).mif $(TARGET).map
@@ -83,4 +103,4 @@ clean:
 # Rebuild everything
 rebuild: clean all
 
-.PHONY: all clean rebuild install
+.PHONY: all clean rebuild install disasm
