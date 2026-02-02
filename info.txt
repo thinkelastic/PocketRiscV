@@ -1,0 +1,4 @@
+VexRiscv RISC-V Demo
+
+A demonstration core featuring a VexRiscv RISC-V CPU with text display output.
+Runs Llama-2 inference on startup.
