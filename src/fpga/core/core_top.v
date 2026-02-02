@@ -704,13 +704,9 @@ assign video_hs = vidout_hs;
     wire [31:0] term_mem_rdata;
     wire        term_mem_ready;
 
-    // CPU to framebuffer interface signals
-    wire        fb_mem_valid;
-    wire [31:0] fb_mem_addr;
-    wire [31:0] fb_mem_wdata;
-    wire [3:0]  fb_mem_wstrb;
-    wire [31:0] fb_mem_rdata;
-    wire        fb_mem_ready;
+    // Display mode and framebuffer address from CPU
+    wire display_mode;
+    wire [24:0] fb_display_addr;
 
     // VexRiscv CPU system - run at 133 MHz (same as SDRAM controller, no CDC needed)
     cpu_system cpu (
@@ -718,6 +714,7 @@ assign video_hs = vidout_hs;
         .clk_74a(clk_74a),
         .reset_n(reset_n),
         .dataslot_allcomplete(dataslot_allcomplete),
+        .vsync(vidout_vs),
         // Terminal interface
         .term_mem_valid(term_mem_valid),
         .term_mem_addr(term_mem_addr),
@@ -725,13 +722,6 @@ assign video_hs = vidout_hs;
         .term_mem_wstrb(term_mem_wstrb),
         .term_mem_rdata(term_mem_rdata),
         .term_mem_ready(term_mem_ready),
-        // Framebuffer interface
-        .fb_mem_valid(fb_mem_valid),
-        .fb_mem_addr(fb_mem_addr),
-        .fb_mem_wdata(fb_mem_wdata),
-        .fb_mem_wstrb(fb_mem_wstrb),
-        .fb_mem_rdata(fb_mem_rdata),
-        .fb_mem_ready(fb_mem_ready),
         // SDRAM interface (directly to io_sdram word interface via core_top)
         .sdram_rd(cpu_sdram_rd),
         .sdram_wr(cpu_sdram_wr),
@@ -740,11 +730,10 @@ assign video_hs = vidout_hs;
         .sdram_rdata(cpu_sdram_rdata),
         .sdram_busy(cpu_sdram_busy),
         .sdram_rdata_valid(ram1_word_q_valid),
-        .display_mode(display_mode)
+        // Display control
+        .display_mode(display_mode),
+        .fb_display_addr(fb_display_addr)
     );
-
-    // Display mode: 0=terminal overlay, 1=framebuffer only
-    wire display_mode;
 
     // Terminal display (40x30 characters, 320x240 pixels)
     wire [23:0] terminal_pixel_color;
@@ -764,22 +753,43 @@ assign video_hs = vidout_hs;
         .mem_ready(term_mem_ready)
     );
 
-    // RGB565 Framebuffer (320x240 pixels)
+    // Line start signal for video scanout (pulses when x_count == 0)
+    reg line_start;
+    always @(posedge clk_core_12288) begin
+        line_start <= (x_count == 0);
+    end
+
+    // Video scanout from SDRAM framebuffer
     wire [23:0] framebuffer_pixel_color;
 
-    framebuffer fb (
-        .clk(clk_core_12288),
-        .clk_cpu(clk_ram_controller),
+    // Burst interface signals for video scanout
+    wire        video_burst_rd;
+    wire [24:0] video_burst_addr;
+    wire [10:0] video_burst_len;
+    wire        video_burst_32bit;
+    wire [31:0] video_burst_data;
+    wire        video_burst_data_valid;
+    wire        video_burst_data_done;
+
+    video_scanout scanout (
+        // Video clock domain
+        .clk_video(clk_core_12288),
         .reset_n(reset_n),
-        .pixel_x(visible_x),
-        .pixel_y(visible_y),
+        .x_count(x_count),
+        .y_count(y_count),
+        .line_start(line_start),
         .pixel_color(framebuffer_pixel_color),
-        .mem_valid(fb_mem_valid),
-        .mem_addr(fb_mem_addr),
-        .mem_wdata(fb_mem_wdata),
-        .mem_wstrb(fb_mem_wstrb),
-        .mem_rdata(fb_mem_rdata),
-        .mem_ready(fb_mem_ready)
+        .fb_base_addr(fb_display_addr),
+        // SDRAM clock domain
+        .clk_sdram(clk_ram_controller),
+        // SDRAM burst interface
+        .burst_rd(video_burst_rd),
+        .burst_addr(video_burst_addr),
+        .burst_len(video_burst_len),
+        .burst_32bit(video_burst_32bit),
+        .burst_data(video_burst_data),
+        .burst_data_valid(video_burst_data_valid),
+        .burst_data_done(video_burst_data_done)
     );
 
 always @(posedge clk_core_12288 or negedge reset_n) begin
@@ -948,14 +958,14 @@ io_sdram isr0 (
     .phy_dq         ( dram_dq ),
     .phy_dqm        ( dram_dqm ),
 
-    // Burst interface - not used
-    .burst_rd           ( 1'b0 ),
-    .burst_addr         ( 25'b0 ),
-    .burst_len          ( 11'b0 ),
-    .burst_32bit        ( 1'b0 ),
-    .burst_data         ( ),
-    .burst_data_valid   ( ),
-    .burst_data_done    ( ),
+    // Burst interface - used for video scanout
+    .burst_rd           ( video_burst_rd ),
+    .burst_addr         ( video_burst_addr ),
+    .burst_len          ( video_burst_len ),
+    .burst_32bit        ( video_burst_32bit ),
+    .burst_data         ( video_burst_data ),
+    .burst_data_valid   ( video_burst_data_valid ),
+    .burst_data_done    ( video_burst_data_done ),
 
     // Burst write interface - not used
     .burstwr        ( 1'b0 ),

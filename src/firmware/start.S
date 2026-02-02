@@ -1,6 +1,7 @@
 /*
  * VexRiscv Circle Demo
- * Draws a circle on the RGB565 framebuffer
+ * Draws a circle on the RGB565 framebuffer in SDRAM
+ * Uses double buffering with vsync swap
  */
 
 .section .text.start
@@ -8,8 +9,17 @@
 
 /* Memory addresses */
 .equ TERMINAL_BASE, 0x20000000
-.equ FRAMEBUFFER_BASE, 0x28000000
-.equ SYS_DISPLAY_MODE, 0x4000000C   /* Display mode register */
+
+/* Framebuffer in SDRAM (double buffered) */
+.equ FRAMEBUFFER_0, 0x10000000     /* Display buffer (shown on screen) */
+.equ FRAMEBUFFER_1, 0x10100000     /* Draw buffer (offscreen) */
+
+/* System registers */
+.equ SYS_DISPLAY_MODE, 0x4000000C  /* Display mode: 0=terminal, 1=framebuffer */
+.equ SYS_FB_DISPLAY, 0x40000010    /* Display buffer address (read-only) */
+.equ SYS_FB_DRAW, 0x40000014       /* Draw buffer address (read-only) */
+.equ SYS_FB_SWAP, 0x40000018       /* Write 1 to swap buffers on vsync */
+
 .equ FB_WIDTH, 320
 .equ FB_HEIGHT, 240
 
@@ -41,9 +51,9 @@ _start:
     li t1, DISPLAY_MODE_FRAMEBUFFER
     sw t1, 0(t0)
 
-    /* Clear framebuffer to dark blue */
-    lui a0, %hi(FRAMEBUFFER_BASE)
-    addi a0, a0, %lo(FRAMEBUFFER_BASE)
+    /* Clear framebuffer to dark blue (draw to back buffer) */
+    lui a0, %hi(FRAMEBUFFER_1)
+    addi a0, a0, %lo(FRAMEBUFFER_1)
     li a1, FB_WIDTH * FB_HEIGHT     /* pixel count */
     li a2, 0x0010                   /* dark blue */
     jal clear_framebuffer
@@ -61,6 +71,11 @@ _start:
     li a2, CIRCLE_R
     li a3, COLOR_RED
     jal draw_circle
+
+    /* Swap buffers - display the back buffer on next vsync */
+    li t0, SYS_FB_SWAP
+    li t1, 1
+    sw t1, 0(t0)
 
 halt:
     j halt
@@ -104,8 +119,8 @@ put_pixel:
     add t0, t0, t1          /* t0 = y * 640 */
     slli t1, a0, 1          /* t1 = x * 2 */
     add t0, t0, t1          /* t0 = y * 640 + x * 2 */
-    lui t1, %hi(FRAMEBUFFER_BASE)
-    addi t1, t1, %lo(FRAMEBUFFER_BASE)
+    lui t1, %hi(FRAMEBUFFER_1)
+    addi t1, t1, %lo(FRAMEBUFFER_1)
     add t0, t0, t1          /* t0 = final address */
     sh a2, 0(t0)            /* Store pixel */
 put_pixel_skip:

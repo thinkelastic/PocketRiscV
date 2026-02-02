@@ -3,8 +3,7 @@
 // - VexRiscv RISC-V CPU with Wishbone interface
 // - 64KB RAM for program/data (using block RAM)
 // - Memory-mapped terminal at 0x20000000
-// - Framebuffer at 0x28000000 (320x240 RGB565)
-// - SDRAM access at 0x10000000 (64MB)
+// - SDRAM access at 0x10000000 (64MB) - includes framebuffer
 // - System registers at 0x40000000
 //
 
@@ -15,6 +14,7 @@ module cpu_system (
     input wire clk_74a,       // Bridge clock (74.25 MHz) - for APF interface
     input wire reset_n,
     input wire dataslot_allcomplete,  // All data slots loaded by APF
+    input wire vsync,         // Vertical sync for buffer swap timing
 
     // Terminal memory interface
     output wire        term_mem_valid,
@@ -23,14 +23,6 @@ module cpu_system (
     output wire [3:0]  term_mem_wstrb,
     input wire  [31:0] term_mem_rdata,
     input wire         term_mem_ready,
-
-    // Framebuffer memory interface
-    output wire        fb_mem_valid,
-    output wire [31:0] fb_mem_addr,
-    output wire [31:0] fb_mem_wdata,
-    output wire [3:0]  fb_mem_wstrb,
-    input wire  [31:0] fb_mem_rdata,
-    input wire         fb_mem_ready,
 
     // SDRAM word interface (directly to io_sdram via core_top)
     // CPU and SDRAM controller run at same clock (133 MHz)
@@ -42,8 +34,9 @@ module cpu_system (
     input wire         sdram_busy,
     input wire         sdram_rdata_valid,  // Pulses when read data is valid
 
-    // Display mode output
-    output wire        display_mode  // 0=terminal overlay, 1=framebuffer only
+    // Display control outputs
+    output wire        display_mode,       // 0=terminal overlay, 1=framebuffer only
+    output wire [24:0] fb_display_addr     // SDRAM word address for video scanout
 );
 
 // ============================================
@@ -139,16 +132,16 @@ wire        mem_write = dbus_grant & dbus_we;
 
 // Memory map:
 // 0x00000000 - 0x0000FFFF : RAM (64KB)
-// 0x10000000 - 0x13FFFFFF : SDRAM (64MB)
+// 0x10000000 - 0x13FFFFFF : SDRAM (64MB) - includes framebuffers
+//   Framebuffer 0: 0x10000000 - 0x10025800 (153,600 bytes)
+//   Framebuffer 1: 0x10100000 - 0x10125800 (153,600 bytes)
 // 0x20000000 - 0x20001FFF : Terminal VRAM
-// 0x28000000 - 0x2804AFFF : Framebuffer (320x240 RGB565)
 // 0x40000000 - 0x400000FF : System registers
 
 // Decode memory regions
 wire ram_select    = (mem_addr[31:16] == 16'b0);                    // 0x00000000-0x0000FFFF (64KB)
 wire sdram_select  = (mem_addr[31:26] == 6'b000100);                // 0x10000000-0x13FFFFFF (64MB)
 wire term_select   = (mem_addr[31:13] == 19'h10000);                // 0x20000000-0x20001FFF
-wire fb_select     = (mem_addr[31:19] == 13'h0500);                 // 0x28000000-0x2807FFFF
 wire sysreg_select = (mem_addr[31:8] == 24'h400000);                // 0x40000000-0x400000FF
 
 // ============================================
@@ -202,25 +195,33 @@ assign term_mem_addr = mem_addr;
 assign term_mem_wdata = mem_wdata;
 assign term_mem_wstrb = mem_wstrb;
 
-// Forward framebuffer requests to framebuffer module
-assign fb_mem_valid = mem_valid && fb_select;
-assign fb_mem_addr = mem_addr;
-assign fb_mem_wdata = mem_wdata;
-assign fb_mem_wstrb = mem_wstrb;
-
 // ============================================
 // System registers
 // ============================================
-// 0x00: SYS_STATUS      - Bit 0: always 1 (SDRAM ready), Bit 1: dataslot_allcomplete
-// 0x04: SYS_CYCLE_LO    - Cycle counter low
-// 0x08: SYS_CYCLE_HI    - Cycle counter high
+// 0x00: SYS_STATUS       - Bit 0: always 1 (SDRAM ready), Bit 1: dataslot_allcomplete
+// 0x04: SYS_CYCLE_LO     - Cycle counter low
+// 0x08: SYS_CYCLE_HI     - Cycle counter high
+// 0x0C: SYS_DISPLAY_MODE - 0=terminal overlay, 1=framebuffer only
+// 0x10: SYS_FB_DISPLAY   - Display framebuffer SDRAM address (read-only)
+// 0x14: SYS_FB_DRAW      - Draw framebuffer SDRAM address (read-only)
+// 0x18: SYS_FB_SWAP      - Write 1 to swap buffers (on next vsync)
 // 0x0C: SYS_DISPLAY_MODE - 0=terminal overlay, 1=framebuffer only
 
 reg [31:0] sysreg_rdata;
 reg [63:0] cycle_counter;
 reg display_mode_reg;  // 0=terminal overlay, 1=framebuffer only
 
+// Double buffer addresses (25-bit SDRAM word addresses)
+// Buffer 0: 0x10000000 byte addr = 0x0000000 word addr (base of SDRAM)
+// Buffer 1: 0x10100000 byte addr = 0x0080000 word addr (1MB into SDRAM)
+localparam FB_ADDR_0 = 25'h0000000;  // Framebuffer 0 at SDRAM base
+localparam FB_ADDR_1 = 25'h0080000;  // Framebuffer 1 at 1MB offset
+reg [24:0] fb_display_addr_reg;      // Currently displayed buffer
+reg [24:0] fb_draw_addr_reg;         // Buffer being drawn to
+reg fb_swap_pending;                  // Swap requested, waiting for vsync
+
 assign display_mode = display_mode_reg;
+assign fb_display_addr = fb_display_addr_reg;
 
 // Synchronize dataslot_allcomplete from bridge clock domain (clk_74a) to CPU clock domain
 reg [2:0] dataslot_allcomplete_sync;
@@ -229,16 +230,40 @@ always @(posedge clk) begin
 end
 wire dataslot_allcomplete_s = dataslot_allcomplete_sync[2];
 
+// Synchronize vsync to CPU clock domain
+reg [2:0] vsync_sync;
+always @(posedge clk) begin
+    vsync_sync <= {vsync_sync[1:0], vsync};
+end
+wire vsync_rising = vsync_sync[1] && !vsync_sync[2];
+
 always @(posedge clk) begin
     if (reset) begin
         cycle_counter <= 0;
         display_mode_reg <= 0;  // Start in terminal overlay mode
+        fb_display_addr_reg <= FB_ADDR_0;
+        fb_draw_addr_reg <= FB_ADDR_1;
+        fb_swap_pending <= 0;
     end else begin
         cycle_counter <= cycle_counter + 1;
+
+        // Perform buffer swap on vsync if pending
+        if (fb_swap_pending && vsync_rising) begin
+            // Swap display and draw addresses
+            fb_display_addr_reg <= fb_draw_addr_reg;
+            fb_draw_addr_reg <= fb_display_addr_reg;
+            fb_swap_pending <= 0;
+        end
 
         // Write to display mode register (0x4000000C)
         if (mem_valid && sysreg_select && |mem_wstrb && mem_addr[7:2] == 6'b000011) begin
             display_mode_reg <= mem_wdata[0];
+        end
+
+        // Write to swap register (0x40000018) - request buffer swap
+        if (mem_valid && sysreg_select && |mem_wstrb && mem_addr[7:2] == 6'b000110) begin
+            if (mem_wdata[0])
+                fb_swap_pending <= 1;
         end
     end
 end
@@ -249,6 +274,9 @@ always @(*) begin
         6'b000001: sysreg_rdata = cycle_counter[31:0];   // SYS_CYCLE_LO
         6'b000010: sysreg_rdata = cycle_counter[63:32];  // SYS_CYCLE_HI
         6'b000011: sysreg_rdata = {31'b0, display_mode_reg};  // SYS_DISPLAY_MODE
+        6'b000100: sysreg_rdata = {7'b0, fb_display_addr_reg};  // SYS_FB_DISPLAY
+        6'b000101: sysreg_rdata = {7'b0, fb_draw_addr_reg};     // SYS_FB_DRAW
+        6'b000110: sysreg_rdata = {31'b0, fb_swap_pending};     // SYS_FB_SWAP
         default: sysreg_rdata = 32'h0;
     endcase
 end
@@ -263,7 +291,6 @@ reg mem_pending;
 reg [1:0] pending_bus;  // 0=none, 1=ibus, 2=dbus
 reg ram_pending;
 reg term_pending;
-reg fb_pending;
 reg sdram_read_pending;
 reg sdram_write_pending;
 reg sdram_write_started;
@@ -284,7 +311,6 @@ always @(posedge clk or posedge reset) begin
         pending_bus <= BUS_NONE;
         ram_pending <= 0;
         term_pending <= 0;
-        fb_pending <= 0;
         sdram_read_pending <= 0;
         sdram_write_pending <= 0;
         sdram_write_started <= 0;
@@ -324,9 +350,6 @@ always @(posedge clk or posedge reset) begin
             end else if (term_select) begin
                 mem_pending <= 1;
                 term_pending <= 1;
-            end else if (fb_select) begin
-                mem_pending <= 1;
-                fb_pending <= 1;
             end else if (sysreg_select) begin
                 mem_pending <= 1;
                 sysreg_pending <= 1;
@@ -393,17 +416,6 @@ always @(posedge clk or posedge reset) begin
                 end
                 mem_pending <= 0;
                 term_pending <= 0;
-                pending_bus <= BUS_NONE;
-            end else if (fb_pending && fb_mem_ready) begin
-                if (pending_bus == BUS_DBUS) begin
-                    dbus_ack <= 1;
-                    dbus_dat_miso <= fb_mem_rdata;
-                end else begin
-                    ibus_ack <= 1;
-                    ibus_dat_miso <= fb_mem_rdata;
-                end
-                mem_pending <= 0;
-                fb_pending <= 0;
                 pending_bus <= BUS_NONE;
             end else if (sysreg_pending) begin
                 if (pending_bus == BUS_DBUS) begin
