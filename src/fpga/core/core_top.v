@@ -318,7 +318,9 @@ assign vpll_feed = 1'bZ;
 
 
 // Bridge read data mux
-reg     [31:0]  ram1_bridge_rd_data;
+// NOTE: bridge_rd_data_captured is in clk_ram_controller domain but read here in clk_74a.
+// This is safe because: (1) data is captured before bridge_rd_done asserts, and
+// (2) bridge_rd_done goes through 2-stage sync, so data is stable for 2+ cycles when read.
 
 always @(*) begin
     casex(bridge_addr)
@@ -327,7 +329,7 @@ always @(*) begin
     end
     32'b000000xx_xxxxxxxx_xxxxxxxx_xxxxxxxx: begin
         // SDRAM mapped at 0x00000000 - 0x03FFFFFF (64MB)
-        bridge_rd_data <= ram1_bridge_rd_data;
+        bridge_rd_data <= bridge_rd_data_captured;
     end
     32'hF8xxxxxx: begin
         bridge_rd_data <= cmd_bridge_rd_data;
@@ -344,6 +346,8 @@ reg [31:0] bridge_wr_data_ram_clk;
 reg bridge_wr_done, bridge_rd_done;  // Feedback to 74a domain
 reg bridge_wr_done_sync1, bridge_wr_done_sync2;
 reg bridge_rd_done_sync1, bridge_rd_done_sync2;
+reg bridge_rd_pending;  // Tracks bridge read in progress (waiting for data)
+reg [31:0] bridge_rd_data_captured;  // Data captured in clk_ram_controller domain
 
 // Capture bridge signals in clk_74a domain
 // IMPORTANT: Hold the captured values until the RAM controller has processed them
@@ -374,7 +378,8 @@ always @(posedge clk_74a) begin
         8'b000000xx: begin
             bridge_sdram_rd <= 1;
             bridge_addr_captured <= bridge_addr;
-            ram1_bridge_rd_data <= ram1_word_q;  // Capture for bridge read (pipelined)
+            // NOTE: Don't capture ram1_word_q here - data isn't ready yet!
+            // Data will be captured in clk_ram_controller domain when ram1_word_q_valid asserts
         end
         endcase
     end
@@ -406,12 +411,21 @@ always @(posedge clk_ram_controller) begin
         bridge_addr_ram_clk <= bridge_addr_captured;
     end
 
-    // Signal done on sync4 rising edge - AFTER data has been captured and used
+    // Signal write done on sync4 rising edge
     if (bridge_wr_sync4 && !bridge_wr_done) begin
         bridge_wr_done <= 1;
     end
-    if (bridge_rd_sync4 && !bridge_rd_done) begin
-        bridge_rd_done <= 1;
+
+    // For reads: set pending when read is issued, wait for valid data
+    if (bridge_rd_sync4 && !bridge_rd_pending && !bridge_rd_done) begin
+        bridge_rd_pending <= 1;  // Read issued, waiting for data
+    end
+
+    // Capture read data when valid and we're waiting for it
+    if (bridge_rd_pending && ram1_word_q_valid) begin
+        bridge_rd_data_captured <= ram1_word_q;
+        bridge_rd_pending <= 0;
+        bridge_rd_done <= 1;  // Now we can signal done
     end
 
     // Clear done when sync goes low
@@ -421,7 +435,7 @@ end
 
 // Bridge is active from sync3 through done (when we're processing)
 wire bridge_wr_active = bridge_wr_sync3 | bridge_wr_sync4 | bridge_wr_done;
-wire bridge_rd_active = bridge_rd_sync3 | bridge_rd_sync4 | bridge_rd_done;
+wire bridge_rd_active = bridge_rd_sync3 | bridge_rd_sync4 | bridge_rd_pending | bridge_rd_done;
 
 // SDRAM access arbiter - runs at SDRAM controller clock (133 MHz)
 // Bridge has priority, CPU runs when bridge is idle
@@ -442,11 +456,11 @@ always @(posedge clk_ram_controller) begin
         ram1_word_addr <= bridge_addr_ram_clk[25:2];
     end else if (!bridge_wr_active && !bridge_rd_active) begin
         // CPU SDRAM access - same clock domain, direct connection
+        // Use else-if to prevent undefined behavior if both rd and wr are asserted
         if (cpu_sdram_rd) begin
             ram1_word_rd <= 1;
             ram1_word_addr <= cpu_sdram_addr;
-        end
-        if (cpu_sdram_wr) begin
+        end else if (cpu_sdram_wr) begin
             ram1_word_wr <= 1;
             ram1_word_addr <= cpu_sdram_addr;
             ram1_word_data <= cpu_sdram_wdata;
@@ -690,6 +704,14 @@ assign video_hs = vidout_hs;
     wire [31:0] term_mem_rdata;
     wire        term_mem_ready;
 
+    // CPU to framebuffer interface signals
+    wire        fb_mem_valid;
+    wire [31:0] fb_mem_addr;
+    wire [31:0] fb_mem_wdata;
+    wire [3:0]  fb_mem_wstrb;
+    wire [31:0] fb_mem_rdata;
+    wire        fb_mem_ready;
+
     // VexRiscv CPU system - run at 133 MHz (same as SDRAM controller, no CDC needed)
     cpu_system cpu (
         .clk(clk_ram_controller),  // 133 MHz - same as SDRAM controller
@@ -703,6 +725,13 @@ assign video_hs = vidout_hs;
         .term_mem_wstrb(term_mem_wstrb),
         .term_mem_rdata(term_mem_rdata),
         .term_mem_ready(term_mem_ready),
+        // Framebuffer interface
+        .fb_mem_valid(fb_mem_valid),
+        .fb_mem_addr(fb_mem_addr),
+        .fb_mem_wdata(fb_mem_wdata),
+        .fb_mem_wstrb(fb_mem_wstrb),
+        .fb_mem_rdata(fb_mem_rdata),
+        .fb_mem_ready(fb_mem_ready),
         // SDRAM interface (directly to io_sdram word interface via core_top)
         .sdram_rd(cpu_sdram_rd),
         .sdram_wr(cpu_sdram_wr),
@@ -710,8 +739,12 @@ assign video_hs = vidout_hs;
         .sdram_wdata(cpu_sdram_wdata),
         .sdram_rdata(cpu_sdram_rdata),
         .sdram_busy(cpu_sdram_busy),
-        .sdram_rdata_valid(ram1_word_q_valid)
+        .sdram_rdata_valid(ram1_word_q_valid),
+        .display_mode(display_mode)
     );
+
+    // Display mode: 0=terminal overlay, 1=framebuffer only
+    wire display_mode;
 
     // Terminal display (40x30 characters, 320x240 pixels)
     wire [23:0] terminal_pixel_color;
@@ -729,6 +762,24 @@ assign video_hs = vidout_hs;
         .mem_wstrb(term_mem_wstrb),
         .mem_rdata(term_mem_rdata),
         .mem_ready(term_mem_ready)
+    );
+
+    // RGB565 Framebuffer (320x240 pixels)
+    wire [23:0] framebuffer_pixel_color;
+
+    framebuffer fb (
+        .clk(clk_core_12288),
+        .clk_cpu(clk_ram_controller),
+        .reset_n(reset_n),
+        .pixel_x(visible_x),
+        .pixel_y(visible_y),
+        .pixel_color(framebuffer_pixel_color),
+        .mem_valid(fb_mem_valid),
+        .mem_addr(fb_mem_addr),
+        .mem_wdata(fb_mem_wdata),
+        .mem_wstrb(fb_mem_wstrb),
+        .mem_rdata(fb_mem_rdata),
+        .mem_ready(fb_mem_ready)
     );
 
 always @(posedge clk_core_12288 or negedge reset_n) begin
@@ -782,8 +833,17 @@ always @(posedge clk_core_12288 or negedge reset_n) begin
                 // data enable. this is the active region of the line
                 vidout_de <= 1;
 
-                // Display terminal output
-                vidout_rgb <= terminal_pixel_color;
+                // Display mode: 0=terminal overlay, 1=framebuffer only
+                if (display_mode) begin
+                    // Framebuffer only mode
+                    vidout_rgb <= framebuffer_pixel_color;
+                end else begin
+                    // Terminal overlay mode - white text overlays framebuffer
+                    if (terminal_pixel_color == 24'hFFFFFF)
+                        vidout_rgb <= terminal_pixel_color;
+                    else
+                        vidout_rgb <= framebuffer_pixel_color;
+                end
             end
         end
     end
